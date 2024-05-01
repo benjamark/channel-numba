@@ -1,5 +1,6 @@
 import numpy as np 
 from numba import cuda
+from numba import vectorize, float64
 
 TPB = (8,8,8)  # threads per block (tuned for V100)
 
@@ -8,12 +9,12 @@ N = 17  # must be odd for a point on the centerline
 NITER = 25
 NU = 1/180
 dt = 0.000001
-timesteps = 1000
+timesteps = 10000
 CFL = 0.1
 
 
 @cuda.jit
-def solve_uvw( dt,dx,y,dz,u,v,w,ut,vt,wt, ncv_x, ncv_y, ncv_z, nno_x, nno_y, nno_z ):
+def solve_uvw( dt,dx,y,dz,u,v,w,rhs_u,rhs_v,rhs_w, ncv_x, ncv_y, ncv_z, nno_x, nno_y, nno_z ):
 
     k, j, i = cuda.grid(3)
 
@@ -105,7 +106,7 @@ def solve_uvw( dt,dx,y,dz,u,v,w,ut,vt,wt, ncv_x, ncv_y, ncv_z, nno_x, nno_y, nno
         # compute d2udz2
         diff += NU*( dudzF -dudzB ) / dz
 
-        ut[k,j,i] = u[k,j,i] +dt*( -conv +diff +1.0 )
+        rhs_u[k,j,i] =  -conv +diff +1.0
 
     # y-momentum (final terms land in vcv-centers)
     if (i>=1 and i< ncv_x-1 ) and (j >= 1 and j < nno_y-1) and (k>=1 and k < ncv_z-1):
@@ -187,7 +188,7 @@ def solve_uvw( dt,dx,y,dz,u,v,w,ut,vt,wt, ncv_x, ncv_y, ncv_z, nno_x, nno_y, nno
         dvdzB = ( vcv -vcvB ) / dz
         diff += NU*( dvdzF -dvdzB ) / dz
 
-        vt[k,j,i] = v[k,j,i] +dt*( -conv +diff )
+        rhs_v[k,j,i] = -conv +diff
 
         
     # z-momentum (final terms land in wcv-centers)
@@ -280,7 +281,7 @@ def solve_uvw( dt,dx,y,dz,u,v,w,ut,vt,wt, ncv_x, ncv_y, ncv_z, nno_x, nno_y, nno
         # compute d2wdz2
         diff += NU*( dwdzF -dwdzB ) / dz
 
-        wt[k,j,i] = w[k,j,i] +dt*( -conv +diff )
+        rhs_w[k,j,i] = -conv +diff
 
 
 @cuda.jit
@@ -487,7 +488,7 @@ p = np.load('lam-sol/p749000.npy')
 #u = u*(1 +np.random.random(u.shape)*1e-2)
 #v = v*(1 +np.random.random(v.shape)*1e-2)
 #w = w*(1 +np.random.random(w.shape)*1e-5)
-amp = 1#0.25 
+amp = 0#0.25 
 u += amp * (np.random.random(u.shape) - 0.5)
 #v += amp * (np.random.random(v.shape) - 0.5)
 #w += amp * (np.random.random(w.shape) - 0.5)
@@ -515,6 +516,30 @@ a_back_ = cuda.to_device(a_back)
 a_p_ = cuda.to_device(a_p)
 b_ = cuda.to_device(b)
 
+# allocate RK3 stuff
+rhs_u1_ = cuda.device_array_like(u_)
+rhs_u2_ = cuda.device_array_like(u_)
+rhs_u3_ = cuda.device_array_like(u_)
+rhs_v1_ = cuda.device_array_like(v_)
+rhs_v2_ = cuda.device_array_like(v_)
+rhs_v3_ = cuda.device_array_like(v_)
+rhs_w1_ = cuda.device_array_like(w_)
+rhs_w2_ = cuda.device_array_like(w_)
+rhs_w3_ = cuda.device_array_like(w_)
+
+# allocate device arrays for RK-3 integrator
+u_buf_ = cuda.device_array_like(u_)
+v_buf_ = cuda.device_array_like(v_)
+w_buf_ = cuda.device_array_like(w_)
+
+# RK-3 coefficients
+rk_coef11 = 8.0/15
+rk_coef21 = 1.0/4
+rk_coef22 = 5.0/12
+rk_coef31 = 1.0/4
+rk_coef32 = 0.0
+rk_coef33 = 3.0/4
+
 
 tim = 0.0
 
@@ -522,10 +547,25 @@ BPG = ( int(np.ceil(ncv_x / TPB[0])), \
         int(np.ceil(ncv_y / TPB[1])), \
         int(np.ceil(ncv_z / TPB[2])) )
 
+
+@vectorize([float64(float64, float64, float64)])
+def rk_update_(dt, rk_coef, rhs):
+    return dt*rk_coef * rhs
+
 for istep in range(timesteps):
 
-    solve_uvw[BPG, TPB]   ( dt,dx, y_,dz, u_,v_,w_,ut_,vt_,wt_, ncv_x, ncv_y, ncv_z, \
+    # RK3 step 1
+    u_buf_[:] = u_
+    v_buf_[:] = v_
+    w_buf_[:] = w_
+
+    solve_uvw[BPG, TPB]   ( dt,dx, y_,dz, u_,v_,w_,rhs_u1_,rhs_v1_,rhs_w1_, ncv_x, ncv_y, ncv_z, \
                            nno_x, nno_y, nno_z )
+
+    ut_ = u_ +rk_update_(dt, rk_coef11, rhs_u1_)
+    vt_ = v_ +rk_update_(dt, rk_coef11, rhs_v1_)
+    wt_ = w_ +rk_update_(dt, rk_coef11, rhs_w1_)
+
     apply_BCs[BPG, TPB]   ( ut_, vt_, wt_, p_, ncv_x, ncv_y, ncv_z, \
                            nno_x, nno_y, nno_z )
     populate_rhs[BPG, TPB]( dt,dx, y_, dz, p_,b_,ut_,vt_,wt_, ncv_x, ncv_y, ncv_z, \
@@ -551,11 +591,85 @@ for istep in range(timesteps):
                            nno_x, nno_y, nno_z )
     cuda.synchronize()
 
+
+    # RK3 step 2
+
+    solve_uvw[BPG, TPB]   ( dt,dx, y_,dz, u_,v_,w_,rhs_u2_,rhs_v2_,rhs_w2_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    ut_ = u_buf_ +rk_update_( dt, rk_coef21, rhs_u1_ ) +rk_update_( dt, rk_coef21, rhs_u2_ )
+    vt_ = v_buf_ +rk_update_( dt, rk_coef21, rhs_v1_ ) +rk_update_( dt, rk_coef21, rhs_v2_ )
+    wt_ = w_buf_ +rk_update_( dt, rk_coef21, rhs_w1_ ) +rk_update_( dt, rk_coef21, rhs_w2_ )
+
+    apply_BCs[BPG, TPB]   ( ut_, vt_, wt_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    populate_rhs[BPG, TPB]( dt,dx, y_, dz, p_,b_,ut_,vt_,wt_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    for _ in range(NITER):
+        # update red nodes
+        gs_update[BPG, TPB]( p_, a_east_, a_west_, a_north_, a_south_, \
+                                      a_front_, a_back_, a_p_, b_, 0)
+        # update black nodes
+        cuda.synchronize()
+        gs_update[BPG, TPB]( p_, a_east_, a_west_, a_north_, a_south_, \
+                                      a_front_, a_back_, a_p_, b_, 1)
+        cuda.synchronize()
+
+    apply_BCs[BPG, TPB]   ( ut_, vt_, wt_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    cuda.synchronize()
+    correct_uvw[BPG, TPB] ( dt,dx, y_,dz, u_,v_,w_,p_,ut_,vt_, wt_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    apply_BCs[BPG, TPB]   ( u_, v_, w_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    cuda.synchronize()
+
+    # RK3 step 3
+
+    solve_uvw[BPG, TPB]   ( dt,dx, y_,dz, u_,v_,w_,rhs_u3_,rhs_v3_,rhs_w3_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    ut_ = u_buf_ +rk_update_( dt, rk_coef31, rhs_u1_ ) +rk_update_( dt, rk_coef32, rhs_u2_ ) +\
+                  rk_update_( dt, rk_coef33, rhs_u3_ )
+    vt_ = v_buf_ +rk_update_( dt, rk_coef31, rhs_v1_ ) +rk_update_( dt, rk_coef32, rhs_v2_ ) +\
+                  rk_update_( dt, rk_coef33, rhs_v3_ )
+    wt_ = w_buf_ +rk_update_( dt, rk_coef31, rhs_w1_ ) +rk_update_( dt, rk_coef32, rhs_w2_ ) +\
+                  rk_update_( dt, rk_coef33, rhs_w3_ )
+
+    apply_BCs[BPG, TPB]   ( ut_, vt_, wt_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    populate_rhs[BPG, TPB]( dt,dx, y_, dz, p_,b_,ut_,vt_,wt_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    for _ in range(NITER):
+        # update red nodes
+        gs_update[BPG, TPB]( p_, a_east_, a_west_, a_north_, a_south_, \
+                                      a_front_, a_back_, a_p_, b_, 0)
+        # update black nodes
+        cuda.synchronize()
+        gs_update[BPG, TPB]( p_, a_east_, a_west_, a_north_, a_south_, \
+                                      a_front_, a_back_, a_p_, b_, 1)
+        cuda.synchronize()
+
+    apply_BCs[BPG, TPB]   ( ut_, vt_, wt_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+
+    cuda.synchronize()
+    correct_uvw[BPG, TPB] ( dt,dx, y_,dz, u_,v_,w_,p_,ut_,vt_, wt_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    apply_BCs[BPG, TPB]   ( u_, v_, w_, p_, ncv_x, ncv_y, ncv_z, \
+                           nno_x, nno_y, nno_z )
+    cuda.synchronize()
+
+
     print(f'Time step size: {dt:.8f}')
     print(f'Step count: {istep} of {timesteps}')
     print(f'Simulation time: {tim:.8f}')
 
     tim = tim + dt
+
     if ( istep % 1000 == 0 ):
         u = u_.copy_to_host()
         v = v_.copy_to_host()
@@ -566,6 +680,7 @@ for istep in range(timesteps):
         np.save(f'npys/v{istep}.npy', v)
         np.save(f'npys/w{istep}.npy', w)
         np.save(f'npys/p{istep}.npy', p)
+
 
 np.save(f'npys/y.npy', y)
 np.save(f'npys/x.npy', x)
