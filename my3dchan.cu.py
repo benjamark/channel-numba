@@ -8,8 +8,8 @@ TPB = (8,8,8)  # threads per block (tuned for V100)
 N = 17  # must be odd for a point on the centerline
 NITER = 25
 NU = 1/180
-dt = 0.000001
-timesteps = 10000
+dt = 0.00001
+timesteps = 100000
 CFL = 0.1
 
 
@@ -485,12 +485,9 @@ v = np.load('lam-sol/v749000.npy')
 w = np.load('lam-sol/w749000.npy')
 p = np.load('lam-sol/p749000.npy')
 
-#u = u*(1 +np.random.random(u.shape)*1e-2)
-#v = v*(1 +np.random.random(v.shape)*1e-2)
-#w = w*(1 +np.random.random(w.shape)*1e-5)
-amp = 0#0.25 
+amp = 1#0.25 
 u += amp * (np.random.random(u.shape) - 0.5)
-#v += amp * (np.random.random(v.shape) - 0.5)
+v += amp * (np.random.random(v.shape) - 0.5)
 #w += amp * (np.random.random(w.shape) - 0.5)
 
 print(f'u_max: {np.max(u)}')

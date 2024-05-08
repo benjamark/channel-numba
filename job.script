@@ -1,0 +1,11 @@
+#!/bin/bash
+
+#BSUB -J numba                                         
+#BSUB -o ./output.txt
+#BSUB -q pbatch
+#BSUB -nnodes 1
+#BSUB -W 5:00
+
+#nsys profile --stats=true python3 3d_cavity.cu.py
+#nvprof python3 3d_cavity.cu.py
+python3 my3dchan.cu.py
